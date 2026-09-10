@@ -1,0 +1,11 @@
+streamlit>=1.36
+pandas>=2.2
+numpy>=1.26
+plotly>=5.22
+matplotlib>=3.8
+reportlab>=4.2
+openpyxl>=3.1
+fastapi>=0.115
+uvicorn[standard]>=0.30
+python-multipart>=0.0.9
+pytest>=8.0
