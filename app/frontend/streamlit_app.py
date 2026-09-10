@@ -7,6 +7,43 @@ import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 
+# ============================================================
+# SIMPLE PASSWORD PROTECTION
+# ============================================================
+
+def check_password():
+    """Returns True if the user entered the correct password."""
+
+    def password_entered():
+        if st.session_state["password"] == st.secrets["app_password"]:
+            st.session_state["password_correct"] = True
+            del st.session_state["password"]
+        else:
+            st.session_state["password_correct"] = False
+
+    if "password_correct" not in st.session_state:
+        st.text_input(
+            "Enter password", type="password",
+            on_change=password_entered, key="password"
+        )
+        return False
+
+    elif not st.session_state["password_correct"]:
+        st.text_input(
+            "Enter password", type="password",
+            on_change=password_entered, key="password"
+        )
+        st.error("😕 Incorrect password")
+        return False
+
+    else:
+        return True
+
+
+if not check_password():
+    st.stop()
+
+"=================="
 ROOT=Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path: sys.path.insert(0,str(ROOT))
 from app.backend.analysis.engine import analyze, to_numeric_series
