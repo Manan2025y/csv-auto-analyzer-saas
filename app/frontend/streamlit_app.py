@@ -1,6 +1,6 @@
 """Professional Streamlit client for CSV Auto-Analyzer Global SaaS."""
 from __future__ import annotations
-import json, sys
+import sys
 from pathlib import Path
 import numpy as np
 import pandas as pd
@@ -43,54 +43,481 @@ def check_password():
 if not check_password():
     st.stop()
 
-"=================="
-ROOT=Path(__file__).resolve().parents[2]
-if str(ROOT) not in sys.path: sys.path.insert(0,str(ROOT))
+# Find the project root so the backend packages can be imported reliably.
+ROOT = Path(__file__).resolve().parents[2]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
 from app.backend.analysis.engine import analyze, to_numeric_series
 from app.backend.analysis.qa import answer_question
 from app.backend.currency import CURRENCIES, format_currency
 from app.backend.ecommerce.rules import detect_ecommerce_platform
 from app.backend.forecasting.engine import forecast_series
-from app.backend.i18n import t, TRANSLATIONS
-from app.backend.recommendations.engine import generate_recommendations
 from app.backend.reports.excel_report import excel_report
 from app.backend.reports.pdf_report import pdf_report
 from app.backend.storage import delete_dashboard,list_dashboards,load_dashboard,save_dashboard
 from app.frontend.charts import CHART_PALETTES,CHART_TYPES,automatic_chart_suggestions,build_chart,numeric_columns,prepare_chart_data
 
-st.set_page_config(page_title="CSV Auto-Analyzer",page_icon="📊",layout="wide",initial_sidebar_state="expanded")
+st.set_page_config(
+    page_title="CSV Auto-Analyzer",
+    page_icon="📊",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
 
-DEFAULTS={
- "language":"en","currency":"USD","theme":"Day","dashboard_bg":"#F5F7FB","card_bg":"#FFFFFF","chart_bg":"#FFFFFF",
- "df":None,"filename":"","analysis":None,"dashboard_items":None,"kpi_items":None,"filters":{}
+DEFAULTS = {
+    "currency": "USD",
+    "theme": "Day",
+    "dashboard_bg": "#FFF8E1",
+    "card_bg": "#FFFDF5",
+    "chart_bg": "#FFFDF5",
+    "df": None,
+    "filename": "",
+    "analysis": None,
+    "dashboard_items": None,
+    "kpi_items": None,
+    "filters": {},
+    # NEW: controls for the "same colour for every KPI" toggle in KPI Studio.
+    "kpi_uniform_color": False,
+    "kpi_shared_bg": None,  # resolved lazily to the current theme's card colour
 }
 for k,v in DEFAULTS.items():
     if k not in st.session_state: st.session_state[k]=v
 
-THEMES={
- "Day":{"app":"#F6F8FC","surface":"#FFFFFF","text":"#172033","muted":"#5B6475","border":"#DCE2EC"},
- "Night":{"app":"#08111F","surface":"#111C2E","text":"#F4F7FF","muted":"#B9C5D8","border":"#2B3A50"},
- "Soft Light":{"app":"#FFFDF7","surface":"#FFFFFF","text":"#292524","muted":"#6B625A","border":"#E7DED2"},
- "Midnight Blue":{"app":"#071426","surface":"#0D2039","text":"#EAF3FF","muted":"#A9BED8","border":"#284564"},
+THEMES = {
+    # Light theme: warm, professional and easy on the eyes.
+    "Day": {
+        "app": "#FFF8E1",
+        "surface": "#FFFDF5",
+        "text": "#2B261C",
+        "muted": "#665D4D",
+        "border": "#E8DFC5",
+        "dashboard": "#FFF8E1",
+        "card": "#FFFDF5",
+        "chart": "#FFFDF5",
+    },
+
+    # Dark theme: blue-black surfaces with bright text and clear borders.
+    "Night": {
+        "app": "#08111F",
+        "surface": "#111C2E",
+        "text": "#F4F7FF",
+        "muted": "#B9C5D8",
+        "border": "#2B3A50",
+        "dashboard": "#0D1829",
+        "card": "#132238",
+        "chart": "#132238",
+    },
+
+    # A softer light option for users who do not want the warm Day theme.
+    "Soft Light": {
+        "app": "#F7F3EA",
+        "surface": "#FFFFFF",
+        "text": "#292524",
+        "muted": "#6B625A",
+        "border": "#E0D7C8",
+        "dashboard": "#F7F3EA",
+        "card": "#FFFFFF",
+        "chart": "#FFFFFF",
+    },
+
+    # Darker blue option with slightly brighter blue surfaces.
+    "Midnight Blue": {
+        "app": "#071426",
+        "surface": "#0D2039",
+        "text": "#EAF3FF",
+        "muted": "#A9BED8",
+        "border": "#284564",
+        "dashboard": "#0A1A2E",
+        "card": "#102844",
+        "chart": "#102844",
+    },
 }
 
+
+# ============================================================
+# NEW: keep KPI card colours in sync with the active theme
+# ============================================================
+def sync_kpi_backgrounds(old_theme: str, new_theme: str) -> None:
+    """Move KPI card backgrounds over to the new theme's default colour.
+
+    KPI cards remember their own "background" once they've been shown in
+    KPI Studio (see the colour picker there). Without this helper, a KPI
+    that is still using the *previous* theme's default card colour would
+    stay stuck on that colour forever — e.g. staying white after switching
+    from Day to Night. We only touch KPIs that are still on the OLD
+    theme's default; a KPI where the user deliberately chose a custom
+    colour is left completely untouched, mirroring how dashboard_bg /
+    card_bg / chart_bg already behave above.
+    """
+    old_default = THEMES[old_theme]["card"]
+    new_default = THEMES[new_theme]["card"]
+
+    for collection_name in ("kpi_items", "dashboard_kpis"):
+        collection = st.session_state.get(collection_name) or []
+        for kpi in collection:
+            if not isinstance(kpi, dict):
+                continue
+            # Treat "no background set yet" the same as "still on default".
+            if kpi.get("background", old_default) == old_default:
+                kpi["background"] = new_default
+
+    # If the shared "uniform colour" picker was still on the old default,
+    # move it forward too so the shared swatch reflects the new theme.
+    if st.session_state.get("kpi_shared_bg") in (None, old_default):
+        st.session_state.kpi_shared_bg = new_default
+
+
+def sync_theme_from_settings():
+    """Same theme handling for the Settings page.
+
+    The sidebar and Settings page use different Streamlit widget keys. This
+    function keeps the theme logic in one place while still preserving any
+    custom colours chosen by the user.
+    """
+    old_theme = st.session_state.get("theme", "Day")
+    new_theme = st.session_state.get("settings_theme", old_theme)
+
+    if old_theme == new_theme:
+        return
+
+    old_defaults = THEMES[old_theme]
+    new_defaults = THEMES[new_theme]
+
+    for state_key, colour_key in (
+        ("dashboard_bg", "dashboard"),
+        ("card_bg", "card"),
+        ("chart_bg", "chart"),
+    ):
+        if st.session_state.get(state_key) == old_defaults[colour_key]:
+            st.session_state[state_key] = new_defaults[colour_key]
+
+    # NEW: also carry KPI card backgrounds over to the new theme.
+    sync_kpi_backgrounds(old_theme, new_theme)
+
+    st.session_state.theme = new_theme
+
+
+def sync_theme_from_widget():
+    """Apply a theme change without destroying a user's custom colours.
+
+    If the user is still using the previous theme's default dashboard/card/chart
+    colours, we replace those defaults with the new theme's defaults. If the
+    user deliberately picked a custom colour, we leave it untouched.
+    """
+    old_theme = st.session_state.get("theme", "Day")
+    new_theme = st.session_state.get("sidebar_theme", old_theme)
+
+    if old_theme == new_theme:
+        return
+
+    old_defaults = THEMES[old_theme]
+    new_defaults = THEMES[new_theme]
+
+    for state_key, colour_key in (
+        ("dashboard_bg", "dashboard"),
+        ("card_bg", "card"),
+        ("chart_bg", "chart"),
+    ):
+        # Only replace a colour when it was still the old theme's default.
+        # This protects custom colours selected by the user.
+        if st.session_state.get(state_key) == old_defaults[colour_key]:
+            st.session_state[state_key] = new_defaults[colour_key]
+
+    # NEW: also carry KPI card backgrounds over to the new theme.
+    sync_kpi_backgrounds(old_theme, new_theme)
+
+    st.session_state.theme = new_theme
+
+
 def apply_theme():
-    th=THEMES[st.session_state.theme]
-    st.markdown(f"""<style>
-    .stApp{{background:{th['app']};color:{th['text']}}}
-    .block-container{{max-width:1600px;padding-top:1rem;padding-bottom:4rem}}
-    [data-testid="stSidebar"]{{background:{th['surface']};border-right:1px solid {th['border']}}}
-    [data-testid="stMetric"]{{background:{st.session_state.card_bg};color:{th['text']};border:1px solid {th['border']};border-radius:14px;padding:12px}}
-    [data-testid="stMetricValue"], [data-testid="stMetricLabel"]{{color:{th['text']} !important}}
-    input,textarea,[data-baseweb="select"], [data-baseweb="select"] *{{color:{th['text']} !important}}
-    [data-testid="stSelectbox"] label,[data-testid="stMultiSelect"] label,[data-testid="stTextInput"] label{{color:{th['text']} !important}}
-    button{{color:{th['text']} !important}}
-    h1,h2,h3,h4,p,label,.stMarkdown{{color:{th['text']}}}
-    .hero{{padding:22px 26px;border:1px solid {th['border']};border-radius:20px;background:{st.session_state.dashboard_bg};margin-bottom:18px}}
-    .hero h1{{margin:0;font-size:2.1rem}} .hero p{{margin:5px 0 0;color:{th['muted']}}}
-    .small{{color:{th['muted']};font-size:.86rem}}
-    </style>""",unsafe_allow_html=True)
-apply_theme()
+    """Inject the theme CSS used by the entire Streamlit application.
+
+    Streamlit widgets are built with BaseWeb and several widgets use their own
+    internal elements. Therefore we style the actual widget containers rather
+    than relying only on `.stApp` text inheritance.
+    """
+    theme_name = st.session_state.get("theme", "Day")
+    th = THEMES[theme_name]
+    is_dark = theme_name in {"Night", "Midnight Blue"}
+    color_scheme = "dark" if is_dark else "light"
+
+    st.markdown(
+        f"""
+        <style>
+        /* ==========================================================
+           1. GLOBAL APPLICATION COLOURS
+           ========================================================== */
+        :root {{
+            color-scheme: {color_scheme};
+        }}
+
+        html, body, [data-testid="stAppViewContainer"] {{
+            background: {th['app']} !important;
+        }}
+
+        .stApp {{
+            background: {th['app']} !important;
+            color: {th['text']} !important;
+        }}
+
+        .block-container {{
+            max-width: 1600px;
+            padding-top: 1rem;
+            padding-bottom: 4rem;
+        }}
+
+        /* ==========================================================
+           2. SIDEBAR AND STREAMLIT TOP BAR
+           ========================================================== */
+        [data-testid="stSidebar"] {{
+            background: {th['surface']} !important;
+            border-right: 1px solid {th['border']} !important;
+        }}
+
+        [data-testid="stSidebar"] > div:first-child {{
+            background: {th['surface']} !important;
+        }}
+
+        [data-testid="stHeader"],
+        header[data-testid="stHeader"] {{
+            background: {th['app']} !important;
+        }}
+
+        [data-testid="stToolbar"] {{
+            background: transparent !important;
+        }}
+
+        /* ==========================================================
+           3. NORMAL TEXT
+           Avoid styling every <span>, because Streamlit uses spans
+           internally for icons and widget implementation details.
+           ========================================================== */
+        h1, h2, h3, h4, h5, h6,
+        p, label, li,
+        [data-testid="stMarkdownContainer"] {{
+            color: {th['text']} !important;
+        }}
+
+        [data-testid="stCaptionContainer"] {{
+            color: {th['muted']} !important;
+        }}
+
+        .small {{
+            color: {th['muted']} !important;
+            font-size: 0.86rem;
+        }}
+
+        /* ==========================================================
+           4. BUTTONS
+           The old CSS changed only text colour. Streamlit could still
+           render a white button in Night mode, making the text hard to
+           read. We explicitly set both background and foreground.
+           ========================================================== */
+        [data-testid="stButton"] button,
+        [data-testid="stDownloadButton"] button {{
+            background: {th['surface']} !important;
+            color: {th['text']} !important;
+            border: 1px solid {th['border']} !important;
+            border-radius: 10px !important;
+        }}
+
+        [data-testid="stButton"] button:hover,
+        [data-testid="stDownloadButton"] button:hover {{
+            background: {th['border']} !important;
+            color: {th['text']} !important;
+        }}
+
+        [data-testid="stButton"] button p,
+        [data-testid="stDownloadButton"] button p,
+        [data-testid="stButton"] button span,
+        [data-testid="stDownloadButton"] button span {{
+            color: {th['text']} !important;
+        }}
+
+        /* ==========================================================
+           5. TEXT INPUTS, SELECTBOXES AND MULTISELECTS
+           ========================================================== */
+        input,
+        textarea {{
+            color: {th['text']} !important;
+            background: {th['surface']} !important;
+            border-color: {th['border']} !important;
+        }}
+
+        input::placeholder,
+        textarea::placeholder {{
+            color: {th['muted']} !important;
+            opacity: 1 !important;
+        }}
+
+        [data-baseweb="select"] {{
+            background: {th['surface']} !important;
+            color: {th['text']} !important;
+            border-color: {th['border']} !important;
+        }}
+
+        [data-baseweb="select"] > div {{
+            background: {th['surface']} !important;
+            color: {th['text']} !important;
+            border-color: {th['border']} !important;
+        }}
+
+        [data-baseweb="select"] input,
+        [data-baseweb="select"] [role="combobox"],
+        [data-baseweb="select"] span {{
+            color: {th['text']} !important;
+        }}
+
+        [data-baseweb="popover"],
+        [data-baseweb="menu"],
+        [role="listbox"],
+        [role="option"] {{
+            background: {th['surface']} !important;
+            color: {th['text']} !important;
+        }}
+
+        [role="option"][aria-selected="true"] {{
+            background: {th['border']} !important;
+            color: {th['text']} !important;
+        }}
+
+        /* ==========================================================
+           6. FILE UPLOADER
+           This is one of Streamlit's more deeply nested widgets, so
+           style the dropzone, instructions, buttons and file name.
+
+           FIX: the block below (marked NEW) additionally targets the
+           SVG icons Streamlit renders inside the uploader — the cloud
+           upload icon and the small file/"remove" icons that appear
+           after a file is added. Those are inline SVGs with their own
+           fill colour, so the earlier rules (which only set `color`)
+           never reached them — in Night/Midnight Blue they rendered as
+           a near-black icon on a near-black background.
+           ========================================================== */
+        [data-testid="stFileUploader"] {{
+            color: {th['text']} !important;
+        }}
+
+        [data-testid="stFileUploaderDropzone"] {{
+            background: {th['surface']} !important;
+            border: 1px dashed {th['border']} !important;
+            color: {th['text']} !important;
+        }}
+
+        [data-testid="stFileUploaderDropzone"] * {{
+            color: {th['text']} !important;
+        }}
+
+        [data-testid="stFileUploaderDropzoneInstructions"] {{
+            color: {th['text']} !important;
+        }}
+
+        [data-testid="stFileUploaderDropzoneInstructions"] small {{
+            color: {th['muted']} !important;
+        }}
+
+        [data-testid="stFileUploader"] button {{
+            background: {th['surface']} !important;
+            color: {th['text']} !important;
+            border: 1px solid {th['border']} !important;
+        }}
+
+        /* NEW: cloud-upload icon and any other SVG glyph in the dropzone. */
+        [data-testid="stFileUploaderDropzone"] svg {{
+            fill: {th['muted']} !important;
+            color: {th['muted']} !important;
+        }}
+
+        /* NEW: the row that appears for each uploaded file (name + size). */
+        [data-testid="stFileUploaderFile"] {{
+            background: {th['surface']} !important;
+            color: {th['text']} !important;
+        }}
+
+        [data-testid="stFileUploaderFile"] * {{
+            color: {th['text']} !important;
+        }}
+
+        /* NEW: the small document icon and the "x" remove icon on that row. */
+        [data-testid="stFileUploaderFile"] svg,
+        [data-testid="stFileUploaderDeleteBtn"] svg {{
+            fill: {th['muted']} !important;
+            color: {th['muted']} !important;
+        }}
+
+        /* ==========================================================
+           7. DATAFRAMES / DATA INTELLIGENCE TABLES
+           ========================================================== */
+        [data-testid="stDataFrame"] {{
+            background: {th['surface']} !important;
+            border: 1px solid {th['border']} !important;
+            border-radius: 10px !important;
+            overflow: hidden !important;
+        }}
+
+        [data-testid="stDataFrame"] > div,
+        [data-testid="stDataFrame"] [role="grid"] {{
+            background: {th['surface']} !important;
+            color: {th['text']} !important;
+        }}
+
+        /* ==========================================================
+           8. EXPANDERS AND BORDERED CONTAINERS
+           ========================================================== */
+        [data-testid="stExpander"],
+        [data-testid="stVerticalBlockBorderWrapper"] {{
+            border-color: {th['border']} !important;
+        }}
+
+        [data-testid="stExpander"] > details,
+        [data-testid="stExpander"] summary {{
+            background: {th['surface']} !important;
+            color: {th['text']} !important;
+        }}
+
+        /* ==========================================================
+           9. METRIC CARDS
+           ========================================================== */
+        [data-testid="stMetric"] {{
+            background: {st.session_state.card_bg} !important;
+            color: {th['text']} !important;
+            border: 1px solid {th['border']} !important;
+            border-radius: 14px;
+            padding: 12px;
+        }}
+
+        [data-testid="stMetricValue"],
+        [data-testid="stMetricLabel"],
+        [data-testid="stMetricDelta"] {{
+            color: {th['text']} !important;
+        }}
+
+        /* ==========================================================
+           10. APPLICATION HERO
+           ========================================================== */
+        .hero {{
+            padding: 22px 26px;
+            border: 1px solid {th['border']};
+            border-radius: 20px;
+            background: {st.session_state.dashboard_bg};
+            margin-bottom: 18px;
+        }}
+
+        .hero h1 {{
+            margin: 0;
+            font-size: 2.1rem;
+            color: {th['text']} !important;
+        }}
+
+        .hero p {{
+            margin: 5px 0 0;
+            color: {th['muted']} !important;
+        }}
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
 
 # ---------- helpers ----------
 def is_df_truthy(value):
@@ -186,10 +613,15 @@ def sync_pref(name, widget_key):
 # ---------- sidebar ----------
 with st.sidebar:
     st.markdown("## 📊 CSV Auto-Analyzer")
-    lang=st.selectbox("Language",list(TRANSLATIONS),index=list(TRANSLATIONS).index(st.session_state.language),format_func=lambda x:{"en":"English","hi":"हिन्दी","es":"Español"}[x],key="sidebar_language",on_change=sync_pref,args=("language","sidebar_language"))
     cur_names=list(CURRENCIES)
     st.selectbox("Currency",cur_names,index=cur_names.index(st.session_state.currency),key="sidebar_currency",on_change=sync_pref,args=("currency","sidebar_currency"))
-    st.selectbox("Theme",list(THEMES),index=list(THEMES).index(st.session_state.theme),key="sidebar_theme",on_change=sync_pref,args=("theme","sidebar_theme"))
+    st.selectbox(
+        "Theme",
+        list(THEMES),
+        index=list(THEMES).index(st.session_state.theme),
+        key="sidebar_theme",
+        on_change=sync_theme_from_widget,
+    )
     uploaded=st.file_uploader("Upload CSV",type=["csv"],help="CSV files are analyzed in the current session.")
     st.divider()
     page=st.radio("Workspace",["Dashboard","Chart Studio","KPI Studio","Forecast","Data Intelligence","Reports","Saved Dashboards","Settings"],index=0)
@@ -242,7 +674,29 @@ if page=="Dashboard":
     for i,k in enumerate(kpis[:4]):
         with kc[i]:
             kb=k.get("background",st.session_state.card_bg)
-            st.markdown(f'<div style="background:{kb};border:1px solid #DCE2EC;border-radius:14px;padding:15px 17px;min-height:105px"><div style="font-size:.84rem;opacity:.72">{k.get("name",f"KPI {i+1}")}</div><div style="font-size:1.65rem;font-weight:700;margin-top:7px">{display_kpi(k,df)}</div><div style="font-size:.72rem;opacity:.58;margin-top:5px">{k.get("formula","")}</div></div>',unsafe_allow_html=True)
+            st.markdown(
+                f"""
+                <div class="dashboard-kpi" style="
+                    background:{kb};
+                    color:{THEMES[st.session_state.theme]['text']};
+                    border:1px solid {THEMES[st.session_state.theme]['border']};
+                    border-radius:14px;
+                    padding:15px 17px;
+                    min-height:105px;
+                "">
+                    <div style="font-size:.84rem;color:inherit;opacity:.78">
+                        {k.get('name', f'KPI {i+1}')}
+                    </div>
+                    <div style="font-size:1.65rem;font-weight:700;margin-top:7px;color:inherit">
+                        {display_kpi(k, df)}
+                    </div>
+                    <div style="font-size:.72rem;margin-top:5px;color:inherit;opacity:.62">
+                        {k.get('formula', '')}
+                    </div>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
     st.markdown(f"**Dashboard visuals:** {len(items)} · minimum automatic layout: 8 charts")
     n=len(items); cols_per_row=4 if n>=12 else 3 if n>=9 else 2
     for start in range(0,n,cols_per_row):
@@ -324,20 +778,60 @@ elif page=="KPI Studio":
     items=st.session_state.kpi_items
     a,b,c=st.columns(3)
     with a:
-        if st.button("➕ Add KPI",key="kpi_add"):items.append({"name":"New KPI","formula":"SUM( )","format":"number","background":"#FFFFFF"});st.rerun()
+        # FIX: new KPIs now default to the current theme's card colour
+        # instead of a hardcoded white, so a KPI created in Night theme
+        # is dark from the start.
+        if st.button("➕ Add KPI",key="kpi_add"):items.append({"name":"New KPI","formula":"SUM( )","format":"number","background":st.session_state.card_bg});st.rerun()
     with b:
         if st.button("⚙️ Hide KPI settings",key="kpi_hide"):st.session_state.kpi_settings=not st.session_state.get("kpi_settings",True)
     with c:
         if st.button("➕ Add all KPIs to dashboard",key="kpi_all"):st.session_state.dashboard_kpis=items;st.success("KPIs are available for the dashboard.")
     if st.session_state.get("kpi_settings",True):
         st.info("Formula examples: `SUM(Ordered Product Sales)`, `AVG(Units Ordered)`, `SUM(Sales) / SUM(Units)`, `UNIQUE(Customer ID)`.")
+
+    # ============================================================
+    # NEW: "same colour for all KPIs" control.
+    # When switched on, one shared colour picker drives every KPI
+    # card's background at once instead of colouring each one by hand.
+    # ============================================================
+    uniform_col, picker_col = st.columns([1, 2])
+    with uniform_col:
+        uniform = st.checkbox(
+            "🎨 Use one colour for all KPIs",
+            value=st.session_state.get("kpi_uniform_color", False),
+            key="kpi_uniform_color",
+            help="Turn this on to colour every KPI card the same way, instead of picking a colour for each one individually.",
+        )
+    with picker_col:
+        if uniform:
+            default_shared = st.session_state.get("kpi_shared_bg") or st.session_state.card_bg
+            shared_bg = st.color_picker(
+                "Shared KPI background",
+                default_shared,
+                key="kpi_shared_bg",
+            )
+            # Apply the shared colour to every KPI immediately so the
+            # Dashboard page picks it up as soon as it is set.
+            for k in items:
+                k["background"] = shared_bg
+
     for i,k in enumerate(items):
         with st.container(border=True):
             a,b,c,d=st.columns(4)
             with a:k["name"]=st.text_input("KPI name",k.get("name",f"KPI {i+1}"),key=f"kn_{i}")
             with b:k["formula"]=st.text_input("Custom formula",k.get("formula",""),key=f"kf_{i}")
             with c:k["format"]=st.selectbox("Format",["number","currency","percent"],index=( ["number","currency","percent"].index(k.get("format")) if k.get("format") in ["number","currency","percent"] else 0 ),key=f"kfmt_{i}")
-            with d:k["background"]=st.color_picker("KPI background",k.get("background","#FFFFFF"),key=f"kbg_{i}")
+            with d:
+                if uniform:
+                    # Colour is driven by the shared picker above — show the
+                    # current colour here for reference only, disabled so it
+                    # can't drift out of sync with the shared setting.
+                    st.color_picker("KPI background",k.get("background",st.session_state.card_bg),key=f"kbg_{i}",disabled=True)
+                else:
+                    # FIX: default is now the current theme's card colour
+                    # (was hardcoded "#FFFFFF"), so an untouched KPI follows
+                    # the active theme instead of always starting white.
+                    k["background"]=st.color_picker("KPI background",k.get("background",st.session_state.card_bg),key=f"kbg_{i}")
             st.metric(k["name"],display_kpi(k,df))
             a,b=st.columns(2)
             if a.button("➕ Add to Dashboard",key=f"kadd_{i}"):st.session_state.dashboard_kpis=st.session_state.get("dashboard_kpis",[])+[dict(k)];st.success("KPI added to dashboard.")
@@ -448,8 +942,13 @@ else:
     st.write("These are live application controls, not documentation.")
     a,b=st.columns(2)
     with a:
-        st.selectbox("Interface theme",list(THEMES),index=list(THEMES).index(st.session_state.theme),key="settings_theme",on_change=sync_pref,args=("theme","settings_theme"))
-        st.selectbox("Interface language",list(TRANSLATIONS),index=list(TRANSLATIONS).index(st.session_state.language),key="settings_lang",on_change=sync_pref,args=("language","settings_lang"))
+        st.selectbox(
+            "Interface theme",
+            list(THEMES),
+            index=list(THEMES).index(st.session_state.theme),
+            key="settings_theme",
+            on_change=sync_theme_from_settings,
+        )
         cur=list(CURRENCIES);st.selectbox("Display currency",cur,index=cur.index(st.session_state.currency),key="settings_currency",on_change=sync_pref,args=("currency","settings_currency"))
     with b:
         st.session_state.dashboard_bg=st.color_picker("Default dashboard background",st.session_state.dashboard_bg,key="settings_dashbg")
