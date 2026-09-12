@@ -20,6 +20,10 @@ CHART_PALETTES = {
     "Sunset": ["#7C2D12", "#C2410C", "#EA580C", "#F59E0B", "#E11D48", "#BE123C"],
     "Neon": ["#22C55E", "#06B6D4", "#3B82F6", "#8B5CF6", "#EC4899", "#F97316"],
     "Pastel": ["#93C5FD", "#86EFAC", "#FDE68A", "#FDBA74", "#F9A8D4", "#C4B5FD"],
+    "Berry": ["#831843", "#BE185D", "#DB2777", "#EC4899", "#9D174D", "#701A75"],
+    "Earth": ["#3F2A1D", "#6B4F3A", "#8B6F47", "#A16207", "#4D7C0F", "#365314"],
+    "Cobalt": ["#172554", "#1D4ED8", "#2563EB", "#3B82F6", "#60A5FA", "#1E40AF"],
+    "Aurora": ["#064E3B", "#0F766E", "#0891B2", "#4F46E5", "#7C3AED", "#C026D3"],
     "Monochrome": ["#111827", "#374151", "#4B5563", "#6B7280", "#9CA3AF", "#D1D5DB"],
     "Teal": ["#134E4A", "#115E59", "#0F766E", "#0D9488", "#14B8A6", "#2DD4BF"],
 }
@@ -125,7 +129,8 @@ def create_chart(df, item, height=380):
         temp=df.copy(); temp[y]=numeric_series(temp[y]); fig=px.box(temp,x=x if x else None,y=y,title=title,color_discrete_sequence=palette)
     else:return None
     fig.update_layout(title={"text":title,"x":.02},margin=dict(l=25,r=20,t=55,b=25),height=height,
-                      paper_bgcolor=bg or "rgba(0,0,0,0)",plot_bgcolor="rgba(0,0,0,0)",legend_title_text="",hovermode="x unified")
+                      paper_bgcolor=bg or "rgba(0,0,0,0)",plot_bgcolor="rgba(0,0,0,0)",
+                      font_color=item.get("font_color"),legend_title_text="",hovermode="x unified")
     return fig
 
 
